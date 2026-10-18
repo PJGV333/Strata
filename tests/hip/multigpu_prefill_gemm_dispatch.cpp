@@ -1,4 +1,4 @@
-// Exercise HIP BLAS and the GR SiLU kernel on a persistent thread per device, then return to device 0.
+// Exercise HIP BLAS and the GR SiLU kernel on a persistent thread per device, then return to the first device.
 #include "strata/prefill/gemm.hpp"
 #include "strata/prefill/kernels.hpp"
 
@@ -93,11 +93,12 @@ uint16_t to_f16(float value) {
 }
 
 float from_f16(uint16_t value) {
-    return __half2float(__ushort_as_half(value));
+    const __half_raw raw{value};
+    return __half2float(__half(raw));
 }
 
 bool check_cpu_reference(DeviceState& d, bool f16_io) {
-    constexpr int t = 5, n = 19, k = 128;
+    constexpr int t = 5, n = 96, k = 128;
     std::vector<uint16_t> x((size_t) t * k), w((size_t) n * k);
     std::vector<float> xf(x.size()), wf(w.size());
     for (size_t i = 0; i < x.size(); ++i) {
@@ -145,7 +146,8 @@ bool check_cpu_reference(DeviceState& d, bool f16_io) {
 bool init_gemm(DeviceState& d, const std::string& mode) {
     if (cudaSetDevice(d.ordinal) != cudaSuccess) return false;
     const bool f16_io = strata::prefill::prompt_f16();
-    const bool expected = mode == "1" || (mode == "gfx103x" && d.arch.compare(0, 6, "gfx103") == 0);
+    const bool expected = mode == "1" || mode == "all" ||
+                          (mode == "gfx103x" && d.arch.compare(0, 6, "gfx103") == 0);
     if (f16_io != expected) {
         std::fprintf(stderr, "device %d (%s): STRATA_HIP_PROMPT_F16=%s selected %s; expected %s\n", d.ordinal,
                      d.arch.c_str(), mode.c_str(), f16_io ? "FP16" : "BF16", expected ? "FP16" : "BF16");
@@ -225,9 +227,17 @@ void release(DeviceState& d) {
 
 int main(int argc, char** argv) {
     const std::string mode = argc > 1 ? argv[1] : "gfx103x";
-    const bool reference_only = argc > 2 && std::strcmp(argv[2], "--reference-only") == 0;
-    if ((mode != "0" && mode != "1" && mode != "gfx103x") || argc > (reference_only ? 3 : 2)) {
-        std::fprintf(stderr, "usage: %s [0|1|gfx103x] [--reference-only]\n", argv[0]);
+    bool reference_only = false, reverse = false;
+    for (int i = 2; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--reference-only") == 0) reference_only = true;
+        else if (std::strcmp(argv[i], "--reverse") == 0) reverse = true;
+        else {
+            std::fprintf(stderr, "usage: %s [0|1|all|gfx103x] [--reference-only] [--reverse]\n", argv[0]);
+            return 2;
+        }
+    }
+    if (mode != "0" && mode != "1" && mode != "all" && mode != "gfx103x") {
+        std::fprintf(stderr, "usage: %s [0|1|all|gfx103x] [--reference-only] [--reverse]\n", argv[0]);
         return 2;
     }
 #if defined(_WIN32)
@@ -267,6 +277,7 @@ int main(int argc, char** argv) {
         std::puts("SKIP: need one compiled non-gfx103x GPU and one compiled gfx103x GPU");
         return 77;
     }
+    if (reverse) std::swap(first_device, second_device);
     DeviceState first, second;
     if (!init_buffers(first, first_device) || !init_buffers(second, second_device)) {
         std::puts("could not initialize the mixed-architecture HIP devices");
