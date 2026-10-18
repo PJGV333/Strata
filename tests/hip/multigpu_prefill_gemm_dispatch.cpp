@@ -7,11 +7,12 @@
 #include <hip/hip_fp16.h>
 
 #include <algorithm>
-#include <condition_variable>
-#include <cstdio>
-#include <cstring>
 #include <cmath>
+#include <condition_variable>
+#include <cstdint>
+#include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -45,6 +46,7 @@ bool compiled_for(const std::string& arch) {
 struct DeviceState {
     int ordinal = -1;
     std::string arch;
+    bool f16_io = false;
     cudaStream_t stream = nullptr;
     uint16_t* x = nullptr;
     uint16_t* w = nullptr;
@@ -143,10 +145,165 @@ bool check_cpu_reference(DeviceState& d, bool f16_io) {
     return ok && cleared;
 }
 
+// Seed a deterministic sparse-but-nonzero slice in the full 8192 x 320 x 10240 stress GEMM.
+// The rest of the already-zeroed buffers stay zero, so the GPU exercises the large shape without a huge CPU reference.
+bool prepare_large_nonzero(DeviceState& d) {
+    constexpr int active_k = 128, active_n = 16;
+    std::vector<uint16_t> x(active_k), w((size_t) active_n * active_k);
+    for (int i = 0; i < active_k; ++i) {
+        const float source = 0.02f + (float) (i % 19) * 0.001f;
+        x[i] = d.f16_io ? to_f16(source) : to_bf16(source);
+    }
+    for (int row = 0; row < active_n; ++row)
+        for (int i = 0; i < active_k; ++i)
+            w[(size_t) row * active_k + i] = to_bf16(0.002f + (float) ((row * active_k + i) % 23) * 0.0001f);
+    if (cudaMemcpyAsync(d.x, x.data(), x.size() * sizeof(uint16_t), cudaMemcpyHostToDevice, d.stream) != cudaSuccess)
+        return false;
+    for (int row = 0; row < active_n; ++row)
+        if (cudaMemcpyAsync(d.w + (size_t) row * kK, w.data() + (size_t) row * active_k,
+                            (size_t) active_k * sizeof(uint16_t), cudaMemcpyHostToDevice, d.stream) != cudaSuccess)
+            return false;
+    return cudaStreamSynchronize(d.stream) == cudaSuccess;
+}
+
+bool check_large_reference(DeviceState& d, const char* phase) {
+    constexpr int active_k = 128, active_n = 16, hc = 4;
+    std::vector<uint16_t> x(active_k), w((size_t) active_n * active_k), got_gr(active_n);
+    std::vector<float> xf(active_k), wf((size_t) active_n * active_k), got(active_n);
+    for (int i = 0; i < active_k; ++i) {
+        const float source = 0.02f + (float) (i % 19) * 0.001f;
+        x[i] = d.f16_io ? to_f16(source) : to_bf16(source);
+        xf[i] = d.f16_io ? from_f16(x[i]) : from_bf16(x[i]);
+    }
+    for (int row = 0; row < active_n; ++row)
+        for (int i = 0; i < active_k; ++i) {
+            const size_t q = (size_t) row * active_k + i;
+            w[q] = to_bf16(0.002f + (float) (q % 23) * 0.0001f);
+            wf[q] = from_bf16(w[q]);
+        }
+    if (cudaMemcpy(got.data(), d.y, got.size() * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess ||
+        cudaMemcpy(got_gr.data(), d.y16, got_gr.size() * sizeof(uint16_t), cudaMemcpyDeviceToHost) != cudaSuccess)
+        return false;
+
+    double diff2 = 0.0, ref2 = 0.0, maximum = 0.0;
+    bool finite = true;
+    for (int row = 0; row < active_n; ++row) {
+        double sum = 0.0;
+        for (int i = 0; i < active_k; ++i)
+            sum += (double) xf[i] * wf[(size_t) row * active_k + i];
+        const double delta = (double) got[row] - sum;
+        finite = finite && std::isfinite(got[row]) && got[row] > 0.0f && sum > 0.0;
+        diff2 += delta * delta;
+        ref2 += sum * sum;
+        maximum = std::max(maximum, std::abs(delta));
+    }
+    const double rel = std::sqrt(diff2 / std::max(ref2, 1e-300));
+    const bool gemm_ok = finite && rel < (d.f16_io ? 2e-3 : 1e-4) && maximum < 5e-3;
+    std::printf("device %d (%s), %s: large-shape GEMM vs CPU %s [T=%d N=%d K=%d; checked %d outputs, active K=%d] "
+                "rel_l2=%.3g max_abs=%.3g\n",
+                d.ordinal, d.arch.c_str(), phase, gemm_ok ? "PASS" : "FAIL", kTokens, kN, kK, active_n,
+                active_k, rel, maximum);
+    if (!gemm_ok) return false;
+
+    bool gr_ok = true;
+    double gr_max_abs = 0.0, gr_max_ulp = 0.0;
+    for (int i = 0; i < active_n; ++i) {
+        const double v = (double) got[i] / hc;
+        const double expected = v / (1.0 + std::exp(-v));
+        const float actual = d.f16_io ? from_f16(got_gr[i]) : from_bf16(got_gr[i]);
+        const double error = std::abs((double) actual - expected);
+        const double ulp = std::ldexp(1.0, std::ilogb(std::abs(expected)) - (d.f16_io ? 10 : 7));
+        gr_ok = gr_ok && std::isfinite(actual) && actual > 0.0f && error <= 1.25 * ulp + 1e-7;
+        gr_max_abs = std::max(gr_max_abs, error);
+        gr_max_ulp = std::max(gr_max_ulp, error / ulp);
+    }
+    std::printf("device %d (%s), %s: large-shape GR SiLU vs CPU %s max_abs=%.3g max_ulp=%.3g\n", d.ordinal,
+                d.arch.c_str(), phase, gr_ok ? "PASS" : "FAIL", gr_max_abs, gr_max_ulp);
+    return gr_ok;
+}
+
+// Re-run a small, nonzero GEMM plus GR SiLU after each device phase and after returning to the first device.
+// Reuse the large stress buffers; the small host reference adds no device allocation.
+bool check_transition_reference(DeviceState& d, const char* phase) {
+    constexpr int t = 5, n = kN, k = 128, hc = 4, lr = 320;
+    std::vector<uint16_t> x((size_t) t * k), w((size_t) n * k);
+    std::vector<float> xf(x.size()), wf(w.size());
+    for (size_t i = 0; i < x.size(); ++i) {
+        const float source = 0.02f + (float) (i % 19) * 0.001f;
+        x[i] = d.f16_io ? to_f16(source) : to_bf16(source);
+        xf[i] = d.f16_io ? from_f16(x[i]) : from_bf16(x[i]);
+    }
+    for (size_t i = 0; i < w.size(); ++i) {
+        const float source = 0.002f + (float) (i % 23) * 0.0001f;
+        w[i] = to_bf16(source);
+        wf[i] = from_bf16(w[i]);
+    }
+    const size_t x_bytes = x.size() * sizeof(uint16_t), w_bytes = w.size() * sizeof(uint16_t);
+    const size_t w_clear_bytes = (size_t) kN * kK * sizeof(uint16_t);
+    if (cudaMemcpyAsync(d.x, x.data(), x_bytes, cudaMemcpyHostToDevice, d.stream) != cudaSuccess ||
+        cudaMemcpyAsync(d.w, w.data(), w_bytes, cudaMemcpyHostToDevice, d.stream) != cudaSuccess)
+        return false;
+    d.gemm->bf16(d.x, d.w, d.y, t, n, k, n);
+    if (cudaStreamSynchronize(d.stream) != cudaSuccess) return false;
+    std::vector<float> got((size_t) t * n);
+    if (cudaMemcpy(got.data(), d.y, got.size() * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess) return false;
+
+    double diff2 = 0.0, ref2 = 0.0, maximum = 0.0;
+    bool finite = true;
+    for (int row = 0; row < t; ++row)
+        for (int col = 0; col < n; ++col) {
+            double sum = 0.0;
+            for (int i = 0; i < k; ++i)
+                sum += (double) xf[(size_t) row * k + i] * wf[(size_t) col * k + i];
+            const size_t q = (size_t) row * n + col;
+            const double delta = (double) got[q] - sum;
+            finite = finite && std::isfinite(got[q]);
+            diff2 += delta * delta;
+            ref2 += sum * sum;
+            maximum = std::max(maximum, std::abs(delta));
+        }
+    const double rel = std::sqrt(diff2 / std::max(ref2, 1e-300));
+    const double rel_limit = d.f16_io ? 2e-3 : 1e-4;
+    const bool gemm_ok = finite && ref2 > 0.0 && rel < rel_limit && maximum < 5e-3;
+    std::printf("device %d (%s), %s: nonzero GEMM vs CPU %s rel_l2=%.3g max_abs=%.3g\n", d.ordinal,
+                d.arch.c_str(), phase, gemm_ok ? "PASS" : "FAIL", rel, maximum);
+    if (!gemm_ok) return false;
+
+    strata::prefill::gr_silu(d.y, d.y16, t, d.stream);
+    if (cudaStreamSynchronize(d.stream) != cudaSuccess) return false;
+    std::vector<uint16_t> got_gr((size_t) t * lr);
+    if (cudaMemcpy(got_gr.data(), d.y16, got_gr.size() * sizeof(uint16_t), cudaMemcpyDeviceToHost) != cudaSuccess)
+        return false;
+    bool gr_ok = true;
+    double gr_max_abs = 0.0, gr_max_ulp = 0.0;
+    for (size_t i = 0; i < got_gr.size(); ++i) {
+        // GEMM is compared with its own CPU reference above; compare GR SiLU against its actual FP32 input.
+        const double v = (double) got[i] / hc;
+        const double expected = v / (1.0 + std::exp(-v));
+        const float actual = d.f16_io ? from_f16(got_gr[i]) : from_bf16(got_gr[i]);
+        const double error = std::abs((double) actual - expected);
+        const int exponent = std::ilogb(std::abs(expected));
+        const double ulp = std::ldexp(1.0, exponent - (d.f16_io ? 10 : 7));
+        const double tolerance = 1.25 * ulp + 1e-7;
+        gr_ok = gr_ok && std::isfinite(actual) && error <= tolerance;
+        gr_max_abs = std::max(gr_max_abs, error);
+        gr_max_ulp = std::max(gr_max_ulp, error / ulp);
+    }
+    std::printf("device %d (%s), %s: nonzero GR SiLU vs CPU %s max_abs=%.3g max_ulp=%.3g\n", d.ordinal,
+                d.arch.c_str(), phase, gr_ok ? "PASS" : "FAIL", gr_max_abs, gr_max_ulp);
+
+    // Restore the all-zero stress inputs so the original 43/5/1 large-shape sequence is unchanged.
+    const bool cleared = cudaMemsetAsync(d.x, 0, x_bytes, d.stream) == cudaSuccess &&
+                         cudaMemsetAsync(d.w, 0, w_clear_bytes, d.stream) == cudaSuccess &&
+                         cudaStreamSynchronize(d.stream) == cudaSuccess;
+    return gr_ok && cleared;
+}
+
 bool init_gemm(DeviceState& d, const std::string& mode) {
     if (cudaSetDevice(d.ordinal) != cudaSuccess) return false;
     const bool f16_io = strata::prefill::prompt_f16();
-    const bool expected = mode == "1" || mode == "all" ||
+    d.f16_io = f16_io;
+    const bool expected = (!mode.empty() && mode[0] == '1') || mode == "all" ||
                           (mode == "gfx103x" && d.arch.compare(0, 6, "gfx103") == 0);
     if (f16_io != expected) {
         std::fprintf(stderr, "device %d (%s): STRATA_HIP_PROMPT_F16=%s selected %s; expected %s\n", d.ordinal,
@@ -212,16 +369,30 @@ bool step(DeviceState& d, int count, const char* phase) {
     return true;
 }
 
-void release(DeviceState& d) {
-    if (d.ordinal < 0) return;
-    (void) cudaSetDevice(d.ordinal);
-    if (d.stream) (void) cudaStreamSynchronize(d.stream);
+bool release(DeviceState& d) {
+    if (d.ordinal < 0) return true;
+    bool ok = true;
+    auto check = [&](const char* operation, cudaError_t error) {
+        if (error != cudaSuccess) {
+            std::fprintf(stderr, "device %d (%s): cleanup %s failed: %s\n", d.ordinal, d.arch.c_str(), operation,
+                         cudaGetErrorString(error));
+            ok = false;
+        }
+    };
+    check("cudaSetDevice", cudaSetDevice(d.ordinal));
+    if (d.stream) check("cudaStreamSynchronize", cudaStreamSynchronize(d.stream));
     d.gemm.reset();
-    if (d.x) (void) cudaFree(d.x);
-    if (d.w) (void) cudaFree(d.w);
-    if (d.y) (void) cudaFree(d.y);
-    if (d.y16) (void) cudaFree(d.y16);
-    if (d.stream) (void) cudaStreamDestroy(d.stream);
+    check("Gemm destruction", cudaGetLastError());
+    auto free_device = [&](const char* name, auto* pointer) {
+        if (pointer) check(name, cudaFree(pointer));
+    };
+    free_device("cudaFree(x)", d.x);
+    free_device("cudaFree(w)", d.w);
+    free_device("cudaFree(y)", d.y);
+    free_device("cudaFree(y16)", d.y16);
+    if (d.stream) check("cudaStreamDestroy", cudaStreamDestroy(d.stream));
+    std::printf("device %d (%s): resource cleanup %s\n", d.ordinal, d.arch.c_str(), ok ? "PASS" : "FAIL");
+    return ok;
 }
 } // namespace
 
@@ -236,7 +407,8 @@ int main(int argc, char** argv) {
             return 2;
         }
     }
-    if (mode != "0" && mode != "1" && mode != "all" && mode != "gfx103x") {
+    const bool legacy_prefix = mode.size() > 1 && mode[0] == '1';
+    if (mode != "0" && mode != "1" && !legacy_prefix && mode != "all" && mode != "gfx103x") {
         std::fprintf(stderr, "usage: %s [0|1|all|gfx103x] [--reference-only] [--reverse]\n", argv[0]);
         return 2;
     }
@@ -281,18 +453,16 @@ int main(int argc, char** argv) {
     DeviceState first, second;
     if (!init_buffers(first, first_device) || !init_buffers(second, second_device)) {
         std::puts("could not initialize the mixed-architecture HIP devices");
-        release(second);
-        release(first);
+        (void) release(second);
+        (void) release(first);
         return 1;
     }
     if (reference_only) {
         const bool first_ok = init_gemm(first, mode);
-        first.gemm.reset();
         const bool second_ok = init_gemm(second, mode);
-        second.gemm.reset();
-        release(second);
-        release(first);
-        return first_ok && second_ok ? 0 : 1;
+        const bool second_clean = release(second);
+        const bool first_clean = release(first);
+        return first_ok && second_ok && second_clean && first_clean ? 0 : 1;
     }
 
     std::mutex mutex;
@@ -300,30 +470,33 @@ int main(int argc, char** argv) {
     bool first_done = false, second_done = false;
     bool first_ok = false, second_ok = false, return_ok = false;
     std::thread first_thread([&] {
-        first_ok = init_gemm(first, mode) && step(first, 43, "first stage");
+        first_ok = init_gemm(first, mode) && prepare_large_nonzero(first) && step(first, 43, "first stage") &&
+               check_large_reference(first, "first-device phase") &&
+               check_transition_reference(first, "first-device phase");
         std::unique_lock<std::mutex> lock(mutex);
         first_done = true;
         cv.notify_all();
         cv.wait(lock, [&] { return second_done; });
         lock.unlock();
-        if (first_ok) return_ok = step(first, 1, "return-to-first-device chunk");
-        first.gemm.reset();
+        if (first_ok) return_ok = step(first, 1, "return-to-first-device chunk") &&
+                                  check_transition_reference(first, "return-to-first-device phase");
     });
     std::thread second_thread([&] {
         {
             std::unique_lock<std::mutex> lock(mutex);
             cv.wait(lock, [&] { return first_done; });
         }
-        second_ok = init_gemm(second, mode) && step(second, 5, "second stage");
+        second_ok = init_gemm(second, mode) && prepare_large_nonzero(second) && step(second, 5, "second stage") &&
+                    check_large_reference(second, "second-device phase") &&
+                    check_transition_reference(second, "second-device phase");
         std::lock_guard<std::mutex> lock(mutex);
         second_done = true;
         cv.notify_all();
-        second.gemm.reset();
     });
     first_thread.join();
     second_thread.join();
     const bool ok = first_ok && second_ok && return_ok;
-    release(second);
-    release(first);
-    return ok ? 0 : 1;
+    const bool second_clean = release(second);
+    const bool first_clean = release(first);
+    return ok && second_clean && first_clean ? 0 : 1;
 }

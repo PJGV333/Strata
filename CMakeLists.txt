@@ -751,10 +751,14 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                COMMAND hip_multigpu_prefill_gemm_dispatch 0 --reference-only)
       add_test(NAME hip_multigpu_prefill_gemm_dispatch_legacy_f16_reference
                COMMAND hip_multigpu_prefill_gemm_dispatch 1 --reference-only)
+      # The old parser checked the first character; retain and test this undocumented compatibility behavior.
+      add_test(NAME hip_multigpu_prefill_gemm_dispatch_legacy_prefix_reference
+               COMMAND hip_multigpu_prefill_gemm_dispatch 10 --reference-only)
       add_test(NAME hip_multigpu_prefill_gemm_dispatch_all_f16_reference
                COMMAND hip_multigpu_prefill_gemm_dispatch all --reference-only)
       list(APPEND _strata_hip_tests hip_multigpu_prefill_gemm_dispatch hip_multigpu_prefill_gemm_dispatch_reverse
            hip_multigpu_prefill_gemm_dispatch_bf16_reference hip_multigpu_prefill_gemm_dispatch_legacy_f16_reference
+           hip_multigpu_prefill_gemm_dispatch_legacy_prefix_reference
            hip_multigpu_prefill_gemm_dispatch_all_f16_reference)
     endif()
     add_executable(hip_q2_zero tests/hip/q2_zero.cpp)
@@ -870,6 +874,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                            PROPERTIES TIMEOUT 180 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
       set_tests_properties(hip_multigpu_prefill_gemm_dispatch_bf16_reference
                            hip_multigpu_prefill_gemm_dispatch_legacy_f16_reference
+                           hip_multigpu_prefill_gemm_dispatch_legacy_prefix_reference
                            hip_multigpu_prefill_gemm_dispatch_all_f16_reference
                            PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
     endif()

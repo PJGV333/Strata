@@ -540,13 +540,14 @@ bool prompt_f16() {
     int dev = 0;
     if (hipGetDevice(&dev) != hipSuccess || dev < 0 || dev >= kMaxDev) { (void) hipGetLastError(); return false; }
     if (const int8_t c = cached[dev].load(std::memory_order_relaxed)) return c == 2;
-    // Opt-in (#835): preserve `1` and its `all` alias as FP16-in/FP16-out on every HIP device. `gfx103x` selects
-    // FP16 only on RDNA2 devices, leaving other architectures on BF16 for mixed layer splits. FP16 rounds outputs differently.
+    // Opt-in (#835): preserve the historical first-character `1` check for all-device FP16; `all` is a new explicit
+    // alias. `gfx103x` selects FP16 only on RDNA2 devices, leaving other architectures on BF16 for mixed layer splits.
     const char* e = std::getenv("STRATA_HIP_PROMPT_F16");
     hipDeviceProp_t p{};
     if (hipGetDeviceProperties(&p, dev) != hipSuccess) { (void) hipGetLastError(); p.gcnArchName[0] = 0; }
     const bool gfx103x = std::strncmp(p.gcnArchName, "gfx103", 6) == 0;
-    const bool all = e != nullptr && (std::strcmp(e, "1") == 0 || std::strcmp(e, "all") == 0);
+    // The upstream parser accepted any nonempty value beginning with `1`; retain that undocumented behavior.
+    const bool all = e != nullptr && (e[0] == '1' || std::strcmp(e, "all") == 0);
     const bool gfx103x_only = e != nullptr && std::strcmp(e, "gfx103x") == 0;
     const bool on = all || (gfx103x_only && gfx103x);
     if (on) std::fprintf(stderr, "strata prefill: HIP device %d%s%s - STRATA_HIP_PROMPT_F16=%s: the prompt's 16-bit GEMMs run FP16 in and out "
